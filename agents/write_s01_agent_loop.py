@@ -1,57 +1,28 @@
-#!/usr/bin/env python3
-# Harness: the loop -- keep feeding real tool results back into the model.
-"""
-s01_agent_loop.py - The Agent Loop
-
-This file teaches the smallest useful coding-agent pattern:
-
-    user message
-      -> model reply
-      -> if tool_use: execute tools
-      -> write tool_result back to messages
-      -> continue
-
-It intentionally keeps the loop small, but still makes the loop state explicit
-so later chapters can grow from the same structure.
-"""
-
+import json
 import os
 import subprocess
 from dataclasses import dataclass
 
-try:
-    import readline
-
-    # #143 UTF-8 backspace fix for macOS libedit
-    readline.parse_and_bind("set bind-tty-special-chars off")
-    readline.parse_and_bind("set input-meta on")
-    readline.parse_and_bind("set output-meta on")
-    readline.parse_and_bind("set convert-meta off")
-    readline.parse_and_bind("set enable-meta-keybindings on")
-except ImportError:
-    pass
-
 from anthropic import Anthropic
-from anthropic.types import ToolParam
 from dotenv import load_dotenv
 
+# 获取.env文件中的环境变量，覆盖已有变量
 load_dotenv(override=True)
 
+
+# 优先使用其他模型
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = (
-    f"You are a coding agent at {os.getcwd()}. "
-    "Use bash to inspect and change the workspace. Act first, then report clearly."
-)
+SYSTEM = "你是当前目录【{os.getcwd()}】的智能体助手可以在当前工作空间使用相关bash命令"
 
-TOOLS: list[ToolParam] = [
+TOOLS: list = [
     {
         "name": "bash",
-        "description": "Run a shell command in the current workspace.",
+        "description": "在当前工作空间运行一个shell命令",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -63,37 +34,48 @@ TOOLS: list[ToolParam] = [
 
 @dataclass
 class LoopState:
-    # The minimal loop state: history, loop count, and why we continue.
+    """循环状态，包含当前的消息、轮数和转换原因"""
+
     messages: list
     turn_count: int = 1
     transition_reason: str | None = None
 
 
 def run_bash(command: str) -> str:
+    """
+    执行一个shell命令并返回输出。
+    """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    # any() 任意一个真则为True
     if any(item in command for item in dangerous):
-        return "Error: Dangerous command blocked"
+        return "Error: 不允许执行危险命令"
+
     try:
+        # 使用subprocess.run执行命令，返回结果
         result = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
             capture_output=True,
             text=True,
             timeout=120,
         )
+        return result.stdout
     except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
+        return "Error: 命令执行超时（120秒）"
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-    output = (result.stdout + result.stderr).strip()
-    return output[:50000] if output else "(no output)"
+    output = (result.stdout, result.stderr).strip()
+    return output[:50000] if output else "(未输出任何内容)"
 
 
-def extract_text(content) -> str:
+def extract_text(content: list | object) -> str:
+    """
+    从内容中提取文本，支持 list 或单个对象。
+    """
     if not isinstance(content, list):
         return ""
+
     texts = []
     for block in content:
         text = getattr(block, "text", None)
@@ -103,25 +85,33 @@ def extract_text(content) -> str:
 
 
 def execute_tool_calls(response_content) -> list[dict]:
+    """
+    执行工具调用，返回工具结果的列表。
+    """
     results = []
+
     for block in response_content:
         if block.type != "tool_use":
             continue
+
         command = block.input["command"]
         print(f"\033[33m$ {command}\033[0m")
         output = run_bash(command)
-        print(output[:200])
         results.append(
             {
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": output,
+                "output": output,
             }
         )
     return results
 
 
 def run_one_turn(state: LoopState) -> bool:
+    """
+    执行一轮对话，保存助手结果，返回是否需要继续。
+    """
+    print("当前循环状态：", state)
     response = client.messages.create(
         model=MODEL,
         system=SYSTEM,
@@ -129,8 +119,10 @@ def run_one_turn(state: LoopState) -> bool:
         tools=TOOLS,
         max_tokens=8000,
     )
+    print("response:::", json.dumps(response.model_dump(), indent=2))
     state.messages.append({"role": "assistant", "content": response.content})
 
+    print("助手回复后状态：", state)
     if response.stop_reason != "tool_use":
         state.transition_reason = None
         return False
@@ -142,11 +134,13 @@ def run_one_turn(state: LoopState) -> bool:
 
     state.messages.append({"role": "user", "content": results})
     state.turn_count += 1
-    state.transition_reason = "tool_result"
     return True
 
 
 def agent_loop(state: LoopState) -> None:
+    """
+    执行完整的对话循环。
+    """
     while run_one_turn(state):
         pass
 
@@ -158,14 +152,14 @@ if __name__ == "__main__":
             query = input("\033[36ms01 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "quit", "exit"):
             break
-
         history.append({"role": "user", "content": query})
         state = LoopState(messages=history)
         agent_loop(state)
 
         final_text = extract_text(history[-1]["content"])
+
         if final_text:
             print(final_text)
-        print()
+        print("---------------------")
