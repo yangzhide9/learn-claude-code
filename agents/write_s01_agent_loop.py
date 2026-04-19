@@ -23,7 +23,7 @@ SYSTEM = "你是当前目录【{os.getcwd()}】的智能体助手可以在当前
 TOOLS: list[ToolParam] = [
     {
         "name": "bash",
-        "description": "在当前工作空间一个hello.py文件",
+        "description": "当前是Windows系统，在当前工作目录运行任意shell命令",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -125,6 +125,7 @@ def run_one_turn(state: LoopState) -> bool:
     执行一轮对话，保存助手结果，返回是否需要继续。
     调用工具返回True, 否则返回False。
     """
+    print("每次调用LLM前的消息列表：", state.messages)
     response: Message = client.messages.create(
         model=MODEL,
         system=SYSTEM,
@@ -134,7 +135,9 @@ def run_one_turn(state: LoopState) -> bool:
     )
     # 将助手响应添加到消息列表，保存上下文
     print("response:::", response)
-    print("格式化response", json.dumps(response.model_dump(), indent=2))
+    print(
+        "格式化response", json.dumps(response.model_dump(), indent=2, ensure_ascii=True)
+    )
     state.messages.append({"role": "assistant", "content": response.content})
 
     if response.stop_reason != "tool_use":
