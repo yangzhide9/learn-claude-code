@@ -1,6 +1,7 @@
+import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -18,8 +19,109 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
+PLAN_REMINDER_INTERVAL = 3
 
-SYSTEM = f"你是当前工作目录{WORKDIR}的 编码智能体，使用工具解决任务，赶快行动吧！"
+SYSTEM = f"""你是当前工作目录{WORKDIR}的 编码智能体，使用工具解决任务。
+处理多步骤任务时，使用 todo 工具维护会话计划。
+有多个步骤时，同一时刻只保持一个步骤处于 in_progress 状态。
+随着工作推进及时刷新计划。优先用工具行动，少用文字解释。"""
+
+
+@dataclass
+class PlanItem:
+    content: str
+    status: str = "pending"
+    active_form: str = ""
+
+
+@dataclass
+class PlanningState:
+    items: list[PlanItem] = field(default_factory=list)
+    # 执行了多少轮
+    rounds_since_update: int = 0
+
+
+class TodoManager:
+    """"""
+
+    def __init__(self):
+        self.state = PlanningState()
+
+    def update(self, items: list) -> str:
+        """
+        更新计划，将新的项目列表写入状态。
+        1. 检查项目数量不超过12个
+        2. 检查每个项目的状态是 pending, in_progress 或 completed
+        3. 检查 in_progress 状态的项目数量不超过1个
+        """
+        if len(items) > 12:
+            raise ValueError("保持会话计划简短（最多12个项目）")
+
+        normalized = []
+        in_progress_count = 0
+        for index, raw_item in enumerate(items):
+            content = str(raw_item.get("content", "")).strip()
+            status = str(raw_item.get("status", "pending")).lower()
+            active_form = str(raw_item.get("activeForm", "")).strip()
+
+            if not content:
+                raise ValueError(f"Item {index} 必须有内容")
+            if status not in ["pending", "in_progress", "completed"]:
+                raise ValueError(
+                    f"Item {index} 状态必须是 pending, in_progress 或 completed"
+                )
+            if status == "in_progress":
+                in_progress_count += 1
+
+            normalized.append(
+                PlanItem(content=content, status=status, active_form=active_form)
+            )
+
+        if in_progress_count > 1:
+            raise ValueError("只能有一个处于进行中的任务")
+
+        self.state.items = normalized
+        self.state.rounds_since_update = 0
+        return self.render()
+
+    def note_round_without_update(self) -> None:
+        """
+        执行了一轮但没有更新计划，增加 rounds_since_update。
+        """
+        self.state.rounds_since_update += 1
+
+    def reminder(self) -> str | None:
+        """
+        如果计划为空或 rounds_since_update 小于 PLAN_REMINDER_INTERVAL，返回 None；
+        否则返回提醒文本。
+        """
+        if not self.state.items:
+            return None
+        if self.state.rounds_since_update < PLAN_REMINDER_INTERVAL:
+            return None
+        return "<reminder>在继续之前刷新您当前的计划.</reminder>"
+
+    def render(self) -> str:
+        if not self.state.items:
+            return " 还没有会话计划"
+
+        lines = []
+        for item in self.state.items:
+            marker = {
+                "pending": "[ ] ",
+                "in_progress": "[>]",
+                "completed": "[x]",
+            }[item.status]
+            line = f"{marker} {item.content}"
+            if item.status == "in_progress" and item.active_form:
+                line += f" ({item.active_form})"
+            lines.append(line)
+        completed = sum(1 for item in self.state.items if item.status == "completed")
+        lines.append(f"已完成 {completed}/{len(self.state.items)} 项任务")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
 
 
 def safe_path(p: str) -> Path:
@@ -122,6 +224,7 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
 # claude api工具的json schema
@@ -164,6 +267,34 @@ TOOLS: list[ToolParam] = [
                 "new_text": {"type": "string"},
             },
             "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "todo",
+        "description": "为多步骤工作重写当前会话计划.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional present-continuous label.",
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                },
+            },
+            "required": ["items"],
         },
     },
 ]
@@ -268,13 +399,12 @@ class LoopState:
     transition_reason: str | None = None
 
 
-def agent_loop(messages: list):
+def agent_loop(messages: list) -> None:
     """
     执行完整的对话循环。
     执行一轮时对话时，判断响应结果，如果调用工具，那么拿到工具响应结果追加到消息历史中，
     继续执行下一轮对话，直到不再调用工具则结束循环。
     """
-
     while True:
         """执行一轮对话，调用工具时继续循环，不调用工具时跳出循环"""
         response = client.messages.create(
@@ -285,6 +415,10 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
 
+        print(
+            "打印response:",
+            json.dumps(response.model_dump(), indent=2, ensure_ascii=True),
+        )
         # messages.append({"role": "assistant", "content": response.content})
         # 将TextBlock 和 ToolUseBlock 转换为字典格式，便于后面过滤
         messages.append(
@@ -299,18 +433,30 @@ def agent_loop(messages: list):
             return
 
         results = []
+        used_todo = False
         for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = (
-                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                )
+            if block.type != "tool_use":
+                continue
+            handler = TOOL_HANDLERS.get(block.name)
+            output = (
+                handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            )
 
-                print(f"> {block.name}:")
-                print(output[:200])
-                results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
-                )
+            print(f"> {block.name}:")
+            print(output[:200])
+            results.append(
+                {"type": "tool_result", "tool_use_id": block.id, "content": output}
+            )
+            if block.name == "todo":
+                used_todo = True
+
+        if used_todo:
+            TODO.state.rounds_since_update = 0
+        else:
+            TODO.note_round_without_update()
+            reminder = TODO.reminder()
+            if reminder:
+                results.insert(0, {"type": "text", "text": reminder})
         messages.append({"role": "user", "content": results})
 
 
@@ -318,7 +464,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "quit", "exit"):

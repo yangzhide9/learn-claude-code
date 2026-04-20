@@ -67,11 +67,13 @@ class TodoManager:
             if status == "in_progress":
                 in_progress_count += 1
 
-            normalized.append(PlanItem(
-                content=content,
-                status=status,
-                active_form=active_form,
-            ))
+            normalized.append(
+                PlanItem(
+                    content=content,
+                    status=status,
+                    active_form=active_form,
+                )
+            )
 
         if in_progress_count > 1:
             raise ValueError("Only one plan item can be in_progress")
@@ -181,7 +183,7 @@ TOOL_HANDLERS = {
     "todo": lambda **kw: TODO.update(kw["items"]),
 }
 
-TOOLS = [
+TOOLS: list = [
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -292,16 +294,20 @@ def agent_loop(messages: list) -> None:
 
             handler = TOOL_HANDLERS.get(block.name)
             try:
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                output = (
+                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                )
             except Exception as exc:
                 output = f"Error: {exc}"
 
             print(f"> {block.name}: {str(output)[:200]}")
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": str(output),
-            })
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output),
+                }
+            )
             if block.name == "todo":
                 used_todo = True
 
