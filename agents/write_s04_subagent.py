@@ -1,3 +1,23 @@
+"""
+s04_subagent.py - Subagents
+
+子代理在自己的上下文中工作，共享文件系统，然后只向父agent返回响应摘要
+
+    Parent agent                     Subagent
+    +------------------+             +------------------+
+    | messages=[...]   |             | messages=[]      |  <-- fresh
+    |                  |  dispatch   |                  |
+    | tool: task       | ----------> | while tool_use:  |
+    |   prompt="..."   |             |   call tools     |
+    |   description="" |             |   append results |
+    |                  |  summary    |                  |
+    |   result = "..." | <---------  | return last text |
+    +------------------+             +------------------+
+              |
+    Parent context stays clean.
+    Subagent context is discarded.
+"""
+
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -20,10 +40,17 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 PLAN_REMINDER_INTERVAL = 3
 
-SYSTEM = f"""你是当前工作目录{WORKDIR}的 编码智能体，使用工具解决任务。
+SYSTEM = f"""
+您是当前工作目录{WORKDIR}的 编码智能体，使用工具解决任务。
+可以使用任务工具委派子任务完成。
 处理多步骤任务时，使用 todo 工具维护会话计划。
 有多个步骤时，同一时刻只保持一个步骤处于 in_progress 状态。
 随着工作推进及时刷新计划。优先用工具行动，少用文字解释。"""
+
+SUBAGENT_SYSTEM = f"""
+您是当前工作目录{WORKDIR}的编码智能体子代理。
+完成给定的任务，然后总结您的发现
+"""
 
 
 @dataclass
@@ -298,6 +325,132 @@ TOOLS: list[ToolParam] = [
     },
 ]
 
+CHILD_TOOLS: list[ToolParam] = [
+    {
+        "name": "bash",
+        "description": "当前是Windows系统，在当前工作目录运行任意shell命令",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Replace exact text in file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "todo",
+        "description": "为多步骤工作重写当前会话计划.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                            "activeForm": {
+                                "type": "string",
+                                "description": "Optional present-continuous label.",
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
+]
+
+PARENT_TOOLS: list[ToolParam] = CHILD_TOOLS + [
+    {
+        "name": "task",
+        "description": "生成一个具有新上下文的子代理，它共享文件系统，但不共享对话历史.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "description": {
+                    "type": "string",
+                    "description": "任务简短描述",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
+]
+
+
+def run_subagent(prompt: str) -> str:
+    sub_messages: list = [{"role": "user", "content": prompt}]
+    response = None
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,
+            messages=sub_messages,
+            max_tokens=8000,
+        )
+        sub_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = (
+                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                )
+
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output)[:50000],
+                    }
+                )
+        sub_messages.append({"role": "user", "content": results})
+
+    if response is None:
+        return "(no summary)"
+    return (
+        "".join(b.text for b in response.content if b.type == "text") or "(no summary)"
+    )
+
 
 def normalize_messages(messages: list) -> list:
     """遵循claude api 消息格式规范
@@ -410,16 +563,9 @@ def agent_loop(messages: list) -> None:
             model=MODEL,
             system=SYSTEM,
             messages=normalize_messages(messages),
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=8000,
         )
-
-        # print(
-        #     "打印response:",
-        #     json.dumps(response.model_dump(), indent=2, ensure_ascii=True),
-        # )
-        # messages.append({"role": "assistant", "content": response.content})
-        # 将TextBlock 和 ToolUseBlock 转换为字典格式，便于后面过滤
         messages.append(
             {
                 "role": "assistant",
@@ -436,18 +582,26 @@ def agent_loop(messages: list) -> None:
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            handler = TOOL_HANDLERS.get(block.name)
-            output = (
-                handler(**block.input) if handler else f"Unknown tool: {block.name}"
-            )
 
-            print(f"> {block.name}:")
+            if block.name == "task":
+                desc = block.input.get("description", "subtask")
+                prompt = str(block.input.get("prompt", ""))
+                print(f"> task ({desc}):")
+                print(prompt[:80])
+                output = run_subagent(prompt)
+            else:
+                handler = TOOL_HANDLERS.get(block.name)
+                output = (
+                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                )
+
+            print(f"> 当前使用工具{block.name}:")
+            print(output[:200])
             results.append(
                 {"type": "tool_result", "tool_use_id": block.id, "content": output}
             )
             if block.name == "todo":
                 used_todo = True
-                print(output[:200])
 
         if used_todo:
             TODO.state.rounds_since_update = 0
@@ -474,7 +628,9 @@ if __name__ == "__main__":
         # 会话结束后拿到最后一次响应结果（LLM响应），截取最大长度度字符
         response_content = history[-1]["content"]
 
+        print("------------------------------------------------------")
         final_text = extract_text(response_content)
         if final_text:
             print(final_text)
         print()
+        print("------------------------------------------------------")

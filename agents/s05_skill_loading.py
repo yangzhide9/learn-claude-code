@@ -90,11 +90,7 @@ class SkillRegistry:
             known = ", ".join(sorted(self.documents)) or "(none)"
             return f"Error: Unknown skill '{name}'. Available skills: {known}"
 
-        return (
-            f"<skill name=\"{document.manifest.name}\">\n"
-            f"{document.body}\n"
-            "</skill>"
-        )
+        return f'<skill name="{document.manifest.name}">\n{document.body}\n</skill>'
 
 
 SKILL_REGISTRY = SkillRegistry(SKILLS_DIR)
@@ -174,7 +170,7 @@ TOOL_HANDLERS = {
     "load_skill": lambda **kw: SKILL_REGISTRY.load_full_text(kw["name"]),
 }
 
-TOOLS = [
+TOOLS: list = [
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -265,16 +261,20 @@ def agent_loop(messages: list) -> None:
 
             handler = TOOL_HANDLERS.get(block.name)
             try:
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                output = (
+                    handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                )
             except Exception as exc:
                 output = f"Error: {exc}"
 
             print(f"> {block.name}: {str(output)[:200]}")
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": str(output),
-            })
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": str(output),
+                }
+            )
 
         messages.append({"role": "user", "content": results})
 
