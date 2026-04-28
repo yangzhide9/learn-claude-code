@@ -71,9 +71,8 @@ def run_bash(command: str) -> str:
 
 def extract_text(content: list | object) -> str:
     """
-    从内容中提取文本，支持 list 或单个对象。
+    从内容中提取文本，支持 list 或单个对象，换行拼接后返回
     """
-    print("从内容中提取文本，支持 list 或单个对象")
     if not isinstance(content, list):
         return ""
 
@@ -87,7 +86,7 @@ def extract_text(content: list | object) -> str:
 
 def execute_tool_calls(response_content) -> list[dict]:
     """
-    执行工具调用，返回工具结果的列表。
+    根据LLM的响应数据，执行工具调用，返回工具结果的列表。
 
     从block.type != "tool_use" 可以看出，response_content.stop_reason == "tool_use"时，
     其response_content.content 是一个 list，包含了 type == "tool_use" 类型的 block。
