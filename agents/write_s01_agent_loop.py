@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 from dataclasses import dataclass
@@ -35,7 +34,7 @@ TOOLS: list[ToolParam] = [
 
 @dataclass
 class LoopState:
-    """循环状态，包含当前的消息、轮数和转换原因"""
+    """循环状态，包含当前的消息、轮数和循环原因"""
 
     messages: list
     turn_count: int = 1
@@ -69,16 +68,16 @@ def run_bash(command: str) -> str:
     return output[:50000] if output else "(未输出任何内容)"
 
 
-def extract_text(content: list | object) -> str:
+def extract_text(content: list | str) -> str:
     """
     从内容中提取文本，支持 list 或单个对象，换行拼接后返回
     """
-    if not isinstance(content, list):
-        return ""
+    if isinstance(content, str):
+        return content
 
     texts = []
     for block in content:
-        text = getattr(block, "text", None)
+        text = block.get("text", None)
         if text:
             texts.append(text)
     return "\n".join(texts).strip()
@@ -107,13 +106,12 @@ def execute_tool_calls(response_content) -> list[dict]:
             continue
 
         command = block.input["command"]
-        print(f"\033[33m$ {command}\033[0m")
         output = run_bash(command)
         results.append(
             {
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "output": output,
+                "content": output,
             }
         )
     return results
@@ -124,7 +122,6 @@ def run_one_turn(state: LoopState) -> bool:
     执行一轮对话，保存助手结果，返回是否需要继续。
     调用工具返回True, 否则返回False。
     """
-    print("每次调用LLM前的消息列表：", state.messages)
     response: Message = client.messages.create(
         model=MODEL,
         system=SYSTEM,
@@ -133,11 +130,13 @@ def run_one_turn(state: LoopState) -> bool:
         max_tokens=8000,
     )
     # 将助手响应添加到消息列表，保存上下文
-    print("response:::", response)
-    print(
-        "格式化response", json.dumps(response.model_dump(), indent=2, ensure_ascii=True)
+    state.messages.append(
+        {
+            "role": "assistant",
+            # 将content块转换为字典形式，以便序列化
+            "content": [block.model_dump() for block in response.content],
+        }
     )
-    state.messages.append({"role": "assistant", "content": response.content})
 
     if response.stop_reason != "tool_use":
         state.transition_reason = None
@@ -183,7 +182,6 @@ if __name__ == "__main__":
 
         # 会话结束后拿到最后一次响应结果（LLM响应），截取最大长度度字符
         final_text = extract_text(history[-1]["content"])
-
         if final_text:
             print(final_text)
         print()
